@@ -12,18 +12,26 @@ import mwparserfromhell as mw
 from mwparserfromhell.nodes import Heading, Template
 import requests
 
+
 SOURCE = "User talk:Larawag"
 ARCHIVE = SOURCE + "/Archive closed"
 API = "https://en.wikipedia.org/w/api.php"
+
+EXPECTED_USERNAME = "LarawagArchiveBot@Archiver"
+EXPECTED_ACCOUNT = "LarawagArchiveBot"
+
+MAX_ARCHIVE_BYTES = 500_000
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
+
 LOG = logging.getLogger("archiver")
 
 
 def template_title(name):
+    """Convert a template name into its normal page title."""
     name = str(name).strip().replace("_", " ")
 
     if name.lower().startswith("template:"):
@@ -32,13 +40,14 @@ def template_title(name):
     if not name or ":" in name:
         return None
 
-    if any(c in name for c in "{}[]<>|#\n"):
+    if any(character in name for character in "{}[]<>|#\n"):
         return None
 
     return "Template:" + name[0].upper() + name[1:]
 
 
 def split_topics(text):
+    """Split complete level-2 discussions without changing their text."""
     lead = ""
     topics = []
     current = []
@@ -74,6 +83,22 @@ def split_topics(text):
 
 
 def template_calls(text):
+    """
+    Find actual template calls at the beginning of a line,
+    optionally preceded by whitespace and discussion indentation.
+
+    Recognizes:
+        {{closed}}
+        {{closed|reason=Finished}}
+        :{{closed}}
+        ::{{closed}} Signature and timestamp
+
+    Ignores inline examples such as:
+        You can use {{closed}} here.
+
+    Nested template calls and calls inside comments or nowiki
+    are not treated as independent closure markers.
+    """
     names = set()
     offset = 0
 
@@ -81,16 +106,11 @@ def template_calls(text):
         raw = str(node)
 
         if isinstance(node, Template):
-            start = text.rfind("\n", 0, offset) + 1
-            before = text[start:offset]
-
-            end = offset + len(raw)
-            newline = text.find("\n", end)
-            after = text[end:newline] if newline >= 0 else text[end:]
-
+            line_start = text.rfind("\n", 0, offset) + 1
+            before = text[line_start:offset]
             title = template_title(node.name)
 
-            if title and not before.strip() and not after.strip():
+            if title and not before.replace(":", "").strip():
                 names.add(title)
 
         offset += len(raw)
@@ -99,6 +119,7 @@ def template_calls(text):
 
 
 def marker(topic):
+    """Create a stable identifier for an exact discussion copy."""
     digest = hashlib.sha256(
         (SOURCE + "\n" + topic).encode("utf-8")
     ).hexdigest()
@@ -107,28 +128,44 @@ def marker(topic):
 
 
 def record(topic):
-    return marker(topic) + "\n" + topic + "\n<!-- /LarawagArchiver -->"
+    """Wrap the original discussion in duplicate-detection markers."""
+    return (
+        marker(topic)
+        + "\n"
+        + topic
+        + "\n<!-- /LarawagArchiver -->"
+    )
 
 
 class Wiki:
     def __init__(self):
         self.session = requests.Session()
+
         self.session.headers["User-Agent"] = (
-            "LarawagPersonalArchiver/1.0 "
+            "LarawagPersonalArchiver/1.1 "
             "(https://en.wikipedia.org/wiki/User:Larawag)"
         )
+
         self.account = None
 
     def request(self, write=False, **params):
-        params.update(format="json", formatversion=2, maxlag=5)
+        params.update(
+            format="json",
+            formatversion=2,
+            maxlag=5,
+        )
 
         if write:
             response = self.session.post(
-                API, data=params, timeout=60
+                API,
+                data=params,
+                timeout=60,
             )
         else:
             response = self.session.get(
-                API, params=params, timeout=60
+                API,
+                params=params,
+                timeout=60,
             )
 
         response.raise_for_status()
@@ -145,7 +182,7 @@ class Wiki:
         username = os.environ.get("WIKI_BOT_USERNAME", "")
         password = os.environ.get("WIKI_BOT_PASSWORD", "")
 
-        if username != "LarawagArchiveBot@Archiver" or not password:
+        if username != EXPECTED_USERNAME or not password:
             raise RuntimeError(
                 "Missing or unexpected bot credentials."
             )
@@ -172,7 +209,7 @@ class Wiki:
             meta="userinfo",
         )["query"]["userinfo"]["name"]
 
-        if actual != "LarawagArchiveBot":
+        if actual != EXPECTED_ACCOUNT:
             raise RuntimeError(
                 "Unexpected authenticated account."
             )
@@ -194,7 +231,14 @@ class Wiki:
         if "missing" in page:
             return "", 0
 
-        revision = page["revisions"][0]
+        revisions = page.get("revisions")
+
+        if not revisions:
+            raise RuntimeError(
+                "Could not read page revisions: " + title
+            )
+
+        revision = revisions[0]
 
         return (
             revision["slots"]["main"]["content"],
@@ -202,6 +246,10 @@ class Wiki:
         )
 
     def closed_aliases(self, names):
+        """Resolve observed template names and redirects to Closed."""
+        if not names:
+            return set()
+
         target = self.request(
             action="query",
             titles="Template:Closed",
@@ -213,6 +261,13 @@ class Wiki:
                 "Could not resolve Template:Closed."
             )
 
+        target_id = target.get("pageid")
+
+        if target_id is None:
+            raise RuntimeError(
+                "Template:Closed has no readable page ID."
+            )
+
         matches = set()
 
         for name in sorted(names):
@@ -222,7 +277,7 @@ class Wiki:
                 redirects=1,
             )["query"]["pages"][0]
 
-            if page.get("pageid") == target["pageid"]:
+            if page.get("pageid") == target_id:
                 matches.add(name)
 
         return matches
@@ -233,7 +288,7 @@ class Wiki:
                 "Write outside allowed pages refused."
             )
 
-        if self.account != "LarawagArchiveBot":
+        if self.account != EXPECTED_ACCOUNT:
             raise RuntimeError(
                 "Authenticated bot account required."
             )
@@ -249,11 +304,15 @@ class Wiki:
             **assertions,
         )["query"]["tokens"]["csrftoken"]
 
-        guard = (
-            {"baserevid": revision, "nocreate": 1}
-            if revision
-            else {"createonly": 1}
-        )
+        if revision:
+            guard = {
+                "baserevid": revision,
+                "nocreate": 1,
+            }
+        else:
+            guard = {
+                "createonly": 1,
+            }
 
         result = self.request(
             True,
@@ -267,7 +326,9 @@ class Wiki:
         )
 
         if result.get("edit", {}).get("result") != "Success":
-            raise RuntimeError("Save was not confirmed.")
+            raise RuntimeError(
+                "Save was not confirmed."
+            )
 
 
 def archive(wiki, live):
@@ -282,6 +343,7 @@ def archive(wiki, live):
     calls = [template_calls(topic) for topic in topics]
 
     names = set()
+
     for group in calls:
         names.update(group)
 
@@ -301,6 +363,7 @@ def archive(wiki, live):
 
     for topic in selected:
         heading = mw.parse(topic).filter_headings()[0]
+
         LOG.info(
             "Topic: %s",
             str(heading.title).strip(),
@@ -335,7 +398,7 @@ def archive(wiki, live):
             + "\n"
         )
 
-        if len(updated.encode("utf-8")) > 500_000:
+        if len(updated.encode("utf-8")) > MAX_ARCHIVE_BYTES:
             raise RuntimeError(
                 "Archive reached 500 KB. "
                 "Configure another archive."
@@ -387,20 +450,27 @@ def archive(wiki, live):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Archive closed discussions on User talk:Larawag."
+    )
+
     parser.add_argument(
         "--run",
         action="store_true",
         help="Enable real Wikipedia edits.",
     )
+
     parser.add_argument(
         "--login-test",
         action="store_true",
         help="Test login and preview without editing.",
     )
+
     args = parser.parse_args()
 
-    with Path(__file__).with_suffix(".lock").open("w") as lock:
+    lock_path = Path(__file__).with_suffix(".lock")
+
+    with lock_path.open("w") as lock:
         try:
             fcntl.flock(
                 lock,
