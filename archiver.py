@@ -14,12 +14,11 @@ import requests
 
 
 SOURCE = "User talk:Larawag"
-ARCHIVE = SOURCE + "/Archive closed"
+ARCHIVE = "User:Larawag/Archive"
 API = "https://en.wikipedia.org/w/api.php"
 
 EXPECTED_USERNAME = "LarawagArchiveBot@Archiver"
 EXPECTED_ACCOUNT = "LarawagArchiveBot"
-
 MAX_ARCHIVE_BYTES = 500_000
 
 logging.basicConfig(
@@ -82,40 +81,74 @@ def split_topics(text):
     return lead, topics
 
 
-def template_calls(text):
-    """
-    Find actual template calls at the beginning of a line,
-    optionally preceded by whitespace and discussion indentation.
-
-    Recognizes:
-        {{closed}}
-        {{closed|reason=Finished}}
-        :{{closed}}
-        ::{{closed}} Signature and timestamp
-
-    Ignores inline examples such as:
-        You can use {{closed}} here.
-
-    Nested template calls and calls inside comments or nowiki
-    are not treated as independent closure markers.
-    """
-    names = set()
+def command_nodes(text):
     offset = 0
 
     for node in mw.parse(text).nodes:
         raw = str(node)
+        end = offset + len(raw)
 
-        if isinstance(node, Template):
-            line_start = text.rfind("\n", 0, offset) + 1
-            before = text[line_start:offset]
-            title = template_title(node.name)
+        if isinstance(node, Template) and not node.params:
+            start = text.rfind("\n", 0, offset) + 1
+            stop = text.find("\n", end)
+            after = text[end:stop] if stop >= 0 else text[end:]
+            before = text[start:offset]
 
-            if title and not before.replace(":", "").strip():
-                names.add(title)
+            if not before.replace(":", "").strip() and not after.strip():
+                yield offset, end, template_title(node.name)
 
-        offset += len(raw)
+        offset = end
 
-    return names
+
+def discussion_notice(closed):
+    if closed:
+        icon = "OOjs UI icon lock.svg"
+        title = "This conversation has been closed."
+        detail = (
+            "Please do not add to it. "
+            "Start a new section for further discussion."
+        )
+    else:
+        icon = "Replacement filing cabinet.svg"
+        title = "This conversation has been archived."
+        detail = (
+            "Please start a new section at "
+            "[[User talk:Larawag]] for further discussion."
+        )
+
+    return (
+        '<div style="margin:10px 0;padding:12px 16px;'
+        'border:1px solid #a2a9b1;border-radius:12px;'
+        'background:var(--background-color-neutral-subtle,#f8f9fa);">\n'
+        "[[File:" + icon + "|22px|alt=Discussion status]] "
+        "'''" + title + "''' " + detail + "\n</div>"
+    )
+
+
+def format_topic(topic, archived=False):
+    for start, end, name in reversed(list(command_nodes(topic))):
+        if name == "Template:Closed":
+            replacement = (
+                "<!-- This conversation has been closed. "
+                "Please do not add to it. -->\n"
+                + discussion_notice(True)
+            )
+        elif archived and name == "Template:Archive":
+            replacement = discussion_notice(False)
+        else:
+            continue
+
+        topic = topic[:start] + replacement + topic[end:]
+
+    return topic
+
+
+def template_calls(text):
+    return {
+        name
+        for _, _, name in command_nodes(text)
+        if name
+    }
 
 
 def marker(topic):
@@ -128,11 +161,10 @@ def marker(topic):
 
 
 def record(topic):
-    """Wrap the original discussion in duplicate-detection markers."""
     return (
         marker(topic)
         + "\n"
-        + topic
+        + format_topic(topic, archived=True)
         + "\n<!-- /LarawagArchiver -->"
     )
 
@@ -140,12 +172,10 @@ def record(topic):
 class Wiki:
     def __init__(self):
         self.session = requests.Session()
-
         self.session.headers["User-Agent"] = (
             "LarawagPersonalArchiver/1.1 "
             "(https://en.wikipedia.org/wiki/User:Larawag)"
         )
-
         self.account = None
 
     def request(self, write=False, **params):
@@ -246,41 +276,7 @@ class Wiki:
         )
 
     def closed_aliases(self, names):
-        """Resolve observed template names and redirects to Closed."""
-        if not names:
-            return set()
-
-        target = self.request(
-            action="query",
-            titles="Template:Closed",
-            redirects=1,
-        )["query"]["pages"][0]
-
-        if "missing" in target:
-            raise RuntimeError(
-                "Could not resolve Template:Closed."
-            )
-
-        target_id = target.get("pageid")
-
-        if target_id is None:
-            raise RuntimeError(
-                "Template:Closed has no readable page ID."
-            )
-
-        matches = set()
-
-        for name in sorted(names):
-            page = self.request(
-                action="query",
-                titles=name,
-                redirects=1,
-            )["query"]["pages"][0]
-
-            if page.get("pageid") == target_id:
-                matches.add(name)
-
-        return matches
+        return set(names) & {"Template:Archive"}
 
     def save(self, title, text, revision, summary):
         if title not in (SOURCE, ARCHIVE):
@@ -326,9 +322,7 @@ class Wiki:
         )
 
         if result.get("edit", {}).get("result") != "Success":
-            raise RuntimeError(
-                "Save was not confirmed."
-            )
+            raise RuntimeError("Save was not confirmed.")
 
 
 def archive(wiki, live):
@@ -363,13 +357,33 @@ def archive(wiki, live):
 
     for topic in selected:
         heading = mw.parse(topic).filter_headings()[0]
+        LOG.info("Topic: %s", str(heading.title).strip())
 
-        LOG.info(
-            "Topic: %s",
-            str(heading.title).strip(),
+    closed_count = sum(
+        format_topic(topic) != topic for topic in topics
+    )
+
+    LOG.info(
+        "%d discussion(s) need closed notices.",
+        closed_count,
+    )
+
+    if not live:
+        return
+
+    if not selected:
+        updated_source = lead + "".join(
+            format_topic(topic) for topic in topics
         )
 
-    if not live or not selected:
+        if updated_source != source:
+            wiki.save(
+                SOURCE,
+                updated_source,
+                revision,
+                "Add marked discussion notices; keep discussions in place",
+            )
+
         return
 
     old_archive, archive_revision = wiki.page(ARCHIVE)
@@ -389,7 +403,7 @@ def archive(wiki, live):
 
     if additions:
         if not archive_revision:
-            old_archive = "{{Talk archive}}\n\n"
+            old_archive = "{{Talk archive|User talk:Larawag}}\n\n"
 
         updated = (
             old_archive.rstrip("\n")
@@ -408,16 +422,13 @@ def archive(wiki, live):
             ARCHIVE,
             updated,
             archive_revision,
-            f"Archive closed discussions from [[{SOURCE}]] "
+            f"Archive marked discussions from [[{SOURCE}]] "
             f"(revision {revision})",
         )
 
     verified, _ = wiki.page(ARCHIVE)
 
-    if not all(
-        record(topic) in verified
-        for topic in selected
-    ):
+    if not all(record(topic) in verified for topic in selected):
         raise RuntimeError(
             "Archive verification failed. "
             "Source left intact."
@@ -427,8 +438,7 @@ def archive(wiki, live):
 
     if latest_revision != revision:
         LOG.warning(
-            "Talk page changed; keeping discussions "
-            "until next run."
+            "Talk page changed; keeping discussions until next run."
         )
         return
 
@@ -440,9 +450,9 @@ def archive(wiki, live):
 
     wiki.save(
         SOURCE,
-        lead + "".join(remaining),
+        lead + "".join(format_topic(topic) for topic in remaining),
         revision,
-        f"Archive {len(selected)} closed discussion(s) "
+        f"Archive {len(selected)} marked discussion(s) "
         f"to [[{ARCHIVE}]]",
     )
 
@@ -467,7 +477,6 @@ def main():
     )
 
     args = parser.parse_args()
-
     lock_path = Path(__file__).with_suffix(".lock")
 
     with lock_path.open("w") as lock:
